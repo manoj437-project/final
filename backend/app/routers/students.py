@@ -1,0 +1,1931 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.orm import Session
+from typing import List, Optional
+import json
+import re
+import random
+import logging
+
+logger = logging.getLogger(__name__)
+
+# pyrefly: ignore [missing-import]
+from google import genai as google_genai
+
+from app.database import get_db
+from app.models import Student, StudentScore, Mentor, MentorAction, DailyTopic, TopicHistory, QuizAttempt, BoringReport
+from app.schemas import (
+    StudentScoreCreate, StudentScoreResponse,
+    CohortDashboardResponse, CohortStudent,
+    WeakStudentItem, WeakReportResponse,
+    MentorActionResponse, StudentDetailResponse, StudentScoreHistory,
+    StudentScoreListResponse, QuizStatusResponse,
+    QuizGenerateRequest, QuizGenerateResponse, QuizQuestion,
+    LearningResourcesResponse, LearningResourceItem,
+    TopicPerformanceStudent, TopicPerformanceResponse,
+    SendReportResponse,
+    QuizAttemptCreate, QuizAttemptResponse, QuizAttemptAnswer
+)
+from app.routers.auth import get_current_student, get_current_mentor
+from app.config import settings
+
+router = APIRouter(tags=["Students & Cohorts"])
+
+
+@router.post("/api/students/score", response_model=StudentScoreResponse, status_code=status.HTTP_201_CREATED)
+def log_score(
+    payload: StudentScoreCreate,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """Logs an assessment score for the authenticated student. If not_understood=True, marks weak.
+    After saving, checks overall weak % and emails mentor if > 50%."""
+    import datetime as _dt
+    new_score = StudentScore(
+        student_id=current_student.id,
+        topic=payload.topic,
+        score=payload.score,
+        percentage=payload.percentage,
+        date=payload.date,
+        not_understood=payload.not_understood,
+    )
+    db.add(new_score)
+    db.commit()
+    db.refresh(new_score)
+
+    # NOTE: Auto weak-alert email suppressed — mentor gets the comprehensive
+    # final report via /session-end endpoint only (no duplicate/irrelevant mid-session emails)
+
+    return new_score
+
+
+def _send_high_weak_alert(db, year: str, weak_count: int, total: int, topic: str):
+    """Emails the mentor when overall weak % exceeds 50% — urges re-teaching."""
+    import datetime, smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from app.config import settings
+    YEAR_FULL = {'1': '1st Year', '2': '2nd Year', '3': '3rd Year'}
+    year_label = YEAR_FULL.get(year, f'Year {year}')
+    today_str = datetime.date.today().isoformat()
+    weak_pct = round((weak_count / total) * 100)
+
+    # Find mentors who have records for this cohort
+    mentors = db.query(Mentor).all()
+    if not mentors:
+        return
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  body {{ font-family: Arial, sans-serif; background: #f9fafb; margin: 0; padding: 0; }}
+  .container {{ max-width: 600px; margin: 30px auto; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.10); }}
+  .header {{ background: linear-gradient(135deg, #EF4444, #F59E0B); color: #fff; padding: 28px 32px; }}
+  .header h1 {{ margin: 0 0 6px; font-size: 1.4rem; }}
+  .body {{ padding: 28px 32px; font-size: 0.95rem; color: #111; line-height: 1.7; }}
+  .stat {{ font-size: 2rem; font-weight: 900; color: #EF4444; }}
+  .action {{ background: #fef2f2; border: 1.5px solid #fca5a5; border-radius: 12px; padding: 16px 20px; margin: 18px 0; }}
+  .footer {{ padding: 16px 32px; text-align: center; font-size: 0.75rem; color: #9ca3af; border-top: 1px solid #e5e7eb; }}
+</style></head>
+<body><div class="container">
+  <div class="header"><h1>⚠️ High Weak Student Alert — Action Required</h1>
+    <p>EduMentor AI &nbsp;|&nbsp; {year_label} &nbsp;|&nbsp; {today_str}</p></div>
+  <div class="body">
+    <p>Dear Mentor,</p>
+    <p>This is an automated alert from EduMentor AI.</p>
+    <p>The latest performance data for your <strong>{year_label}</strong> cohort on topic <strong>"{topic}"</strong> shows:</p>
+    <div style="text-align:center;margin:20px 0">
+      <div class="stat">{weak_pct}%</div>
+      <div style="color:#6b7280;font-size:0.85rem">{weak_count} out of {total} students are weak (scored below 50% or reported not understanding)</div>
+    </div>
+    <div class="action">
+      <strong>🎓 Recommended Action:</strong><br>
+      More than half your class needs help. Please consider:
+      <ul style="margin:8px 0;padding-left:18px">
+        <li>Conducting a re-teaching session on <strong>"{topic}"</strong></li>
+        <li>Providing additional study materials or practice problems</li>
+        <li>Holding a doubt-clearing session for struggling students</li>
+      </ul>
+    </div>
+    <p>Log in to your EduMentor AI dashboard to see individual student performance.</p>
+  </div>
+  <div class="footer">Auto-generated by EduMentor AI on {today_str}</div>
+</div></body></html>"""
+
+    for mentor in mentors:
+        mentor_email = mentor.identity
+        subject_line = f"[EduMentor AI] ⚠️ {weak_pct}% of {year_label} students are weak on '{topic}' — Re-teaching needed"
+        sent = False
+        if settings.RESEND_API_KEY:
+            try:
+                import urllib.request, json as _json
+                payload = _json.dumps({"from": settings.RESEND_FROM_EMAIL, "to": [mentor_email],
+                    "subject": subject_line, "html": html_body}).encode()
+                req = urllib.request.Request("https://api.resend.com/emails", data=payload,
+                    headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}", "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status in (200, 201): sent = True
+            except Exception as e:
+                logger.warning(f"Resend failed (weak alert): {e}")
+        if not sent and settings.SMTP_USER and settings.SMTP_PASS:
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject_line
+                msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_USER}>"
+                msg["To"] = mentor_email
+                msg.attach(MIMEText(html_body, "html"))
+                with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                    server.starttls(); server.login(settings.SMTP_USER, settings.SMTP_PASS)
+                    server.sendmail(settings.SMTP_USER, [mentor_email], msg.as_string())
+            except Exception as e:
+                logger.error(f"SMTP failed (weak alert): {e}")
+
+
+@router.post("/api/students/report-boring", status_code=200)
+def report_boring_class(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """Records that a student found the class boring — saves to DB only. Email is sent via /session-end."""
+    import datetime
+
+    today_str = datetime.date.today().isoformat()
+    topic = payload.get("topic", "Today's Topic")
+
+    # Save boring report record only — email will be sent at session-end
+    report = BoringReport(
+        student_id=current_student.id,
+        topic=topic,
+        date=today_str,
+    )
+    db.add(report)
+    db.commit()
+
+    return {"success": True, "message": "Boring report saved. Email will be sent at session end."}
+
+
+@router.post("/api/students/session-end", status_code=200)
+def session_end(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Called when a student's session ends (quiz done OR not_understood).
+    Sends ONE comprehensive email to all mentors containing:
+      1. Summary stats: total, weak %, boring %, performing well
+      2. All students marks table (colour-coded by status)
+      3. Not-understood students section
+      4. Weak (score < 50%) students section
+      5. Boring students section with boring %
+    """
+    import datetime, smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from app.config import settings
+
+    today_str = datetime.date.today().isoformat()
+    topic = payload.get("topic", "Today's Topic")
+    year = current_student.year
+    YEAR_FULL = {'1': '1st Year', '2': '2nd Year', '3': '3rd Year'}
+    year_label = YEAR_FULL.get(year, f'Year {year}')
+
+    # Get current quiz activation time so we can exclude old scores from previous runs of the same topic
+    from app.models import DailyTopic as _DailyTopicSE
+    daily_se = db.query(_DailyTopicSE).filter(_DailyTopicSE.year == year).first()
+    activation_time = daily_se.updated_at if (daily_se and daily_se.updated_at) else None
+
+    # ── 1. Collect all students + categorise scores ──
+    all_students = db.query(Student).filter(Student.year == year).order_by(Student.username.asc()).all()
+    total = len(all_students)
+
+    not_understood_list = []
+    weak_list = []
+    good_list = []
+    all_students_data = []
+
+    for s in all_students:
+        # ONLY use today's score for this specific topic, submitted AFTER the current activation.
+        # This ensures re-activated quizzes don't pick up scores from previous sessions.
+        score_q = (
+            db.query(StudentScore)
+            .filter(
+                StudentScore.student_id == s.id,
+                StudentScore.topic == topic,
+                StudentScore.date == today_str
+            )
+        )
+        if activation_time:
+            score_q = score_q.filter(StudentScore.created_at >= activation_time)
+        score_rec = score_q.order_by(StudentScore.created_at.desc()).first()
+
+        if score_rec:
+            if score_rec.not_understood:
+                not_understood_list.append({
+                    "name": s.username, "regno": s.regno, "email": s.email,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                })
+                all_students_data.append({
+                    "name": s.username, "regno": s.regno,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                    "status": "not_understood",
+                })
+            elif score_rec.percentage < 50:
+                weak_list.append({
+                    "name": s.username, "regno": s.regno, "email": s.email,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                })
+                all_students_data.append({
+                    "name": s.username, "regno": s.regno,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                    "status": "weak",
+                })
+            else:
+                good_list.append({
+                    "name": s.username, "regno": s.regno,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                })
+                all_students_data.append({
+                    "name": s.username, "regno": s.regno,
+                    "score": score_rec.score, "percentage": score_rec.percentage,
+                    "status": "good",
+                })
+        else:
+            all_students_data.append({
+                "name": s.username, "regno": s.regno,
+                "score": None, "percentage": None,
+                "status": "missed",
+            })
+
+    weak_count = len(not_understood_list) + len(weak_list)
+    weak_pct   = round((weak_count / total) * 100) if total else 0
+
+    # ── 2. Collect boring students for today (from current session activation onwards) ──
+    # Get when the quiz was last activated so we only count boring reports from this session
+    from app.models import DailyTopic as _DailyTopic
+    daily_rec = db.query(_DailyTopic).filter(_DailyTopic.year == year).first()
+    session_start = daily_rec.updated_at if (daily_rec and daily_rec.updated_at) else None
+
+    boring_q = (
+        db.query(BoringReport)
+        .join(Student, BoringReport.student_id == Student.id)
+        .filter(Student.year == year, BoringReport.date == today_str)
+    )
+    # If we know when the session started, only count boring reports from THAT point
+    if session_start:
+        boring_q = boring_q.filter(BoringReport.created_at >= session_start)
+    boring_reports = boring_q.all()
+
+    seen_boring = set()
+    boring_students = []
+    for br in boring_reports:
+        s = db.query(Student).filter(Student.id == br.student_id).first()
+        if s and s.regno not in seen_boring:
+            seen_boring.add(s.regno)
+            boring_students.append({"name": s.username, "regno": s.regno, "email": s.email})
+
+    boring_count = len(boring_students)
+    boring_pct   = round((boring_count / total) * 100) if total else 0
+
+    # ── 3. Build HTML ──
+    weak_color   = "#EF4444" if weak_pct > 50 else "#F59E0B" if weak_pct > 25 else "#10B981"
+    boring_color = "#F59E0B" if boring_pct > 30 else "#6B7280"
+
+    alert_banner = ""
+    if weak_pct > 50:
+        alert_banner = (
+            '<div style="background:#fef2f2;border:2px solid #fca5a5;border-radius:12px;'
+            'padding:16px 20px;margin-bottom:24px;">'
+            f'<strong style="color:#EF4444">&#9888; Action Required:</strong> More than 50% of students are struggling on '
+            f'<strong>&quot;{topic}&quot;</strong>. Please consider a re-teaching session.'
+            '</div>'
+        )
+    elif boring_pct > 30:
+        alert_banner = (
+            '<div style="background:#fffbeb;border:2px solid #fcd34d;border-radius:12px;'
+            'padding:16px 20px;margin-bottom:24px;">'
+            f'<strong style="color:#D97706">&#128564; Engagement Alert:</strong> {boring_pct}% of students found today\'s class boring. '
+            f'Consider varying your approach on <strong>&quot;{topic}&quot;</strong>.'
+            '</div>'
+        )
+
+    # All-students marks rows
+    STATUS_STYLE = {
+        "good":           ("&#9989; Good",            "#dcfce7", "#16a34a"),
+        "weak":           ("&#9888; Weak",            "#fff3f3", "#EF4444"),
+        "not_understood": ("&#10060; Not Understood", "#fdf4ff", "#9333ea"),
+        "missed":         ("&#128308; Missed",        "#fffbf0", "#D97706"),
+    }
+    all_marks_rows = ""
+    for sd in all_students_data:
+        label, row_bg, text_color = STATUS_STYLE.get(sd["status"], ("&#8212;", "#fff", "#111"))
+        pct_str   = f"{sd['percentage']}%" if sd['percentage'] is not None else "&#8212;"
+        score_str = sd.get("score") or "&#8212;"
+        all_marks_rows += (
+            f'<tr style="background:{row_bg}">'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{sd["name"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-family:monospace;font-size:0.82rem">{sd["regno"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-weight:700">{score_str}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;text-align:center;font-weight:800;color:{text_color}">{pct_str}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-weight:700;color:{text_color}">{label}</td>'
+            f'</tr>'
+        )
+
+    # Not-understood rows
+    if not_understood_list:
+        not_und_rows = "".join(
+            f'<tr style="background:#fdf4ff">'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{s["name"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-family:monospace">{s["regno"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{s["email"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;color:#9333ea;font-weight:700">&#10060; {s["score"]} ({s["percentage"]}%)</td>'
+            f'</tr>'
+            for s in not_understood_list
+        )
+    else:
+        not_und_rows = '<tr><td colspan="4" style="padding:12px;text-align:center;color:#6b7280">No students reported not understanding today &#127881;</td></tr>'
+
+    # Weak rows
+    if weak_list:
+        weak_rows = "".join(
+            f'<tr style="background:#fff3f3">'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{w["name"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-family:monospace">{w["regno"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{w["email"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;color:#EF4444;font-weight:700">&#9888; {w["score"]} ({w["percentage"]}%)</td>'
+            f'</tr>'
+            for w in weak_list
+        )
+    else:
+        weak_rows = '<tr><td colspan="4" style="padding:12px;text-align:center;color:#6b7280">No low-score students &#127881;</td></tr>'
+
+    # Boring rows
+    if boring_students:
+        boring_rows = "".join(
+            f'<tr style="background:#fffbeb">'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{bs["name"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb;font-family:monospace">{bs["regno"]}</td>'
+            f'<td style="padding:9px 12px;border-bottom:1px solid #e5e7eb">{bs["email"]}</td>'
+            f'</tr>'
+            for bs in boring_students
+        )
+    else:
+        boring_rows = '<tr><td colspan="3" style="padding:12px;text-align:center;color:#6b7280">No boring reports today &#128522;</td></tr>'
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  body {{ font-family: Arial, sans-serif; background: #f4f6fb; margin: 0; padding: 0; }}
+  .container {{ max-width: 720px; margin: 30px auto; background: #fff; border-radius: 18px; overflow: hidden; box-shadow: 0 6px 32px rgba(0,0,0,0.12); }}
+  .header {{ background: linear-gradient(135deg, #7C3AED, #EC4899); color: #fff; padding: 30px 36px; }}
+  .header h1 {{ margin: 0 0 6px; font-size: 1.55rem; letter-spacing: -0.02em; }}
+  .header p {{ margin: 0; opacity: 0.88; font-size: 0.88rem; line-height: 1.5; }}
+  .body {{ padding: 28px 36px; }}
+  .stat-grid {{ display: flex; gap: 12px; margin: 20px 0 26px; }}
+  .stat-box {{ flex: 1; background: #f8f9fc; border-radius: 12px; padding: 16px 10px; text-align: center; border: 1.5px solid #e5e7eb; }}
+  .stat-num {{ font-size: 1.9rem; font-weight: 900; line-height: 1; }}
+  .stat-lbl {{ font-size: 0.7rem; color: #6b7280; margin-top: 5px; line-height: 1.3; text-transform: uppercase; letter-spacing: 0.04em; }}
+  .section-badge {{ display: inline-block; font-size: 0.85rem; font-weight: 800; padding: 6px 14px; border-radius: 8px; margin: 24px 0 10px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-bottom: 6px; }}
+  th {{ background: #7C3AED; color: #fff; padding: 9px 12px; text-align: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; }}
+  .divider {{ height: 1px; background: #e5e7eb; margin: 24px 0; }}
+  .footer {{ padding: 18px 36px; text-align: center; font-size: 0.75rem; color: #9ca3af; border-top: 1px solid #e5e7eb; margin-top: 8px; }}
+</style></head>
+<body><div class="container">
+  <div class="header">
+    <h1>&#128202; Post-Quiz Session Report</h1>
+    <p>EduMentor AI &nbsp;|&nbsp; <strong>{year_label}</strong> &nbsp;|&nbsp; Topic: <strong>{topic}</strong> &nbsp;|&nbsp; {today_str}</p>
+  </div>
+  <div class="body">
+    <p style="color:#374151;margin-top:0">Dear Mentor,</p>
+    <p style="color:#6b7280;font-size:0.9rem;margin-top:-8px">
+      Here is the complete post-quiz report for your <strong>{year_label}</strong> cohort on <strong>&quot;{topic}&quot;</strong>.
+    </p>
+
+    {alert_banner}
+
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-num" style="color:#7C3AED">{total}</div>
+        <div class="stat-lbl">Total<br>Students</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-num" style="color:{weak_color}">{weak_pct}%</div>
+        <div class="stat-lbl">Overall Weak %<br><span style="font-size:0.65rem">({weak_count}/{total})</span></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-num" style="color:{boring_color}">{boring_pct}%</div>
+        <div class="stat-lbl">Class Boring %<br><span style="font-size:0.65rem">({boring_count}/{total})</span></div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-num" style="color:#10B981">{len(good_list)}</div>
+        <div class="stat-lbl">Performing<br>Well</div>
+      </div>
+    </div>
+
+    <div class="section-badge" style="background:#eff6ff;color:#1d4ed8">&#128203; All Students &#8212; Marks Overview ({total})</div>
+    <table>
+      <thead><tr>
+        <th>Student Name</th><th>Register No.</th><th>Score</th><th style="text-align:center">%</th><th>Status</th>
+      </tr></thead>
+      <tbody>{all_marks_rows}</tbody>
+    </table>
+
+    <div class="divider"></div>
+
+    <div class="section-badge" style="background:#fdf4ff;color:#7e22ce">&#10060; Did Not Understand ({len(not_understood_list)})</div>
+    <table>
+      <thead><tr><th>Student Name</th><th>Register No.</th><th>Email</th><th>Score / Status</th></tr></thead>
+      <tbody>{not_und_rows}</tbody>
+    </table>
+
+    <div class="divider"></div>
+
+    <div class="section-badge" style="background:#fef2f2;color:#b91c1c">&#9888; Weak Students &#8212; Score &lt; 50% ({len(weak_list)})</div>
+    <table>
+      <thead><tr><th>Student Name</th><th>Register No.</th><th>Email</th><th>Score</th></tr></thead>
+      <tbody>{weak_rows}</tbody>
+    </table>
+
+    <div class="divider"></div>
+
+    <div class="section-badge" style="background:#fffbeb;color:#92400e">&#128564; Found Class Boring &#8212; {boring_pct}% ({boring_count}/{total})</div>
+    <table>
+      <thead><tr><th>Student Name</th><th>Register No.</th><th>Email</th></tr></thead>
+      <tbody>{boring_rows}</tbody>
+    </table>
+
+    <div class="divider"></div>
+
+    <p style="font-size:0.82rem;color:#6b7280;margin-top:12px">
+      &#128161; Log in to your <strong>EduMentor AI dashboard</strong> to view individual quiz answers and take action.
+    </p>
+  </div>
+  <div class="footer">Auto-generated by EduMentor AI on {today_str} &middot; {year_label} &middot; Topic: {topic}</div>
+</div></body></html>"""
+
+    # ── 4. Find ONLY the mentor who activated this quiz (set_by from latest TopicHistory) ──
+    # We only send the final report to the mentor who activated the current session.
+    from app.models import TopicHistory
+    latest_history = (
+        db.query(TopicHistory)
+        .filter(TopicHistory.year == year, TopicHistory.topic == topic)
+        .order_by(TopicHistory.created_at.desc())
+        .first()
+    )
+    activating_mentor_name = latest_history.set_by if latest_history else None
+
+    # Look up mentor by name to get their email
+    target_mentor = None
+    if activating_mentor_name:
+        target_mentor = db.query(Mentor).filter(Mentor.name == activating_mentor_name).first()
+    # Fallback: if we can't find by name, skip sending (no irrelevant emails)
+    if not target_mentor:
+        logger.warning(f"session-end: Could not find activating mentor '{activating_mentor_name}' — skipping email.")
+        return {
+            "success": True,
+            "weak_pct": weak_pct,
+            "weak_count": weak_count,
+            "boring_pct": boring_pct,
+            "boring_count": boring_count,
+            "not_understood_count": len(not_understood_list),
+            "total_students": total,
+            "email_sent": False,
+        }
+
+    mentor_email = target_mentor.identity
+    subject_line = (
+        f"[EduMentor AI] 📊 Final Quiz Report — {year_label} | "
+        f"Weak: {weak_pct}% | Boring: {boring_pct}% | "
+        f"Not Understood: {len(not_understood_list)} | {topic}"
+    )
+    sent_any = False
+
+    sent = False
+    if settings.RESEND_API_KEY:
+        try:
+            import urllib.request, json as _json
+            req_payload = _json.dumps({
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [mentor_email],
+                "subject": subject_line,
+                "html": html_body
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.resend.com/emails", data=req_payload,
+                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}", "Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    sent = True
+                    sent_any = True
+        except Exception as e:
+            logger.warning(f"Resend failed (session-end summary): {e}")
+    if not sent and settings.SMTP_USER and settings.SMTP_PASS:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject_line
+            msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_USER}>"
+            msg["To"] = mentor_email
+            msg.attach(MIMEText(html_body, "html"))
+            with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                server.starttls()
+                server.login(settings.SMTP_USER, settings.SMTP_PASS)
+                server.sendmail(settings.SMTP_USER, [mentor_email], msg.as_string())
+            sent_any = True
+        except Exception as e:
+            logger.error(f"SMTP failed (session-end summary): {e}")
+
+    return {
+        "success": True,
+        "weak_pct": weak_pct,
+        "weak_count": weak_count,
+        "boring_pct": boring_pct,
+        "boring_count": boring_count,
+        "not_understood_count": len(not_understood_list),
+        "total_students": total,
+        "email_sent": sent_any,
+    }
+
+
+
+@router.post("/api/students/save-attempt", status_code=status.HTTP_201_CREATED)
+def save_quiz_attempt(
+    payload: QuizAttemptCreate,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Saves a student's full quiz Q&A record after completing a quiz.
+    Each answer includes: question, type, options, student_answer, correct_answer, is_correct.
+    """
+    attempt = QuizAttempt(
+        student_id=current_student.id,
+        topic=payload.topic,
+        subject=payload.subject,
+        date=payload.date,
+        score=payload.score,
+        percentage=payload.percentage,
+        answers=[
+            {
+                "q": ans.q,
+                "type": ans.type,
+                "options": ans.options,
+                "student_answer": ans.student_answer,
+                "correct_answer": ans.correct_answer,
+                "is_correct": ans.is_correct,
+            }
+            for ans in payload.answers
+        ]
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    return {"success": True, "attempt_id": attempt.id}
+
+
+@router.get("/api/mentors/student-attempts", response_model=QuizAttemptResponse)
+def get_student_attempts(
+    regno: str = Query(..., description="Student registration number"),
+    topic: str = Query(..., description="Topic name to look up"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """
+    Returns the most recent quiz attempt (full Q&A) for a specific student on a given topic.
+    Mentor-only endpoint. Used in the cohort dashboard to view student quiz answers.
+    Falls back to any attempt for the topic regardless of date when quiz is inactive.
+    """
+    student = db.query(Student).filter(Student.regno == regno).first()
+    if not student:
+        return QuizAttemptResponse(
+            found=False,
+            topic=topic,
+            message=f"Student with regno '{regno}' not found."
+        )
+
+    # Get most recent attempt for this topic (any date)
+    attempt = (
+        db.query(QuizAttempt)
+        .filter(
+            QuizAttempt.student_id == student.id,
+            QuizAttempt.topic == topic
+        )
+        .order_by(QuizAttempt.created_at.desc())
+        .first()
+    )
+
+    if not attempt:
+        return QuizAttemptResponse(
+            found=False,
+            topic=topic,
+            message="No quiz attempt found for this student on this topic."
+        )
+
+    answers = [
+        QuizAttemptAnswer(
+            q=ans.get("q", ""),
+            type=ans.get("type", "MCQ"),
+            options=ans.get("options"),
+            student_answer=ans.get("student_answer", ""),
+            correct_answer=ans.get("correct_answer", ""),
+            is_correct=ans.get("is_correct", False),
+        )
+        for ans in (attempt.answers or [])
+    ]
+
+    return QuizAttemptResponse(
+        found=True,
+        topic=attempt.topic,
+        subject=attempt.subject,
+        date=attempt.date,
+        score=attempt.score,
+        percentage=attempt.percentage,
+        answers=answers,
+        message=""
+    )
+
+
+@router.get("/api/students/scores", response_model=StudentScoreListResponse)
+def get_my_scores(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """Returns the authenticated student's quiz score history (latest first)."""
+    scores = db.query(StudentScore)\
+        .filter(StudentScore.student_id == current_student.id)\
+        .order_by(StudentScore.created_at.desc())\
+        .limit(limit)\
+        .all()
+    return StudentScoreListResponse(
+        scores=[
+            StudentScoreHistory(
+                topic=s.topic,
+                score=s.score,
+                percentage=s.percentage,
+                date=s.date
+            ) for s in scores
+        ],
+        total=len(scores)
+    )
+
+
+@router.get("/api/students/quiz-status", response_model=QuizStatusResponse)
+def get_quiz_status(
+    topic: str = Query(..., description="Topic name to check"),
+    date: str = Query(..., description="Date string (YYYY-MM-DD) to check"),
+    activated_at: str = Query(None, description="ISO timestamp of last quiz activation — if student's score was submitted before this, allow re-attempt"),
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Checks whether the student has already attempted a quiz for the given topic on the given date.
+    If activated_at is provided, only scores submitted AFTER that timestamp count as 'already attempted'.
+    This allows the mentor to re-activate the same topic and let ALL students attempt again.
+    """
+    import datetime as _dt
+    existing = db.query(StudentScore)\
+        .filter(
+            StudentScore.student_id == current_student.id,
+            StudentScore.topic == topic,
+            StudentScore.date == date
+        )\
+        .order_by(StudentScore.created_at.desc())\
+        .first()
+    if existing:
+        # If mentor re-activated the quiz after student's last attempt, allow re-attempt
+        if activated_at:
+            try:
+                act_dt = _dt.datetime.fromisoformat(activated_at.replace('Z', '+00:00'))
+                # Make act_dt timezone-naive for comparison
+                if act_dt.tzinfo is not None:
+                    act_dt = act_dt.replace(tzinfo=None)
+                score_dt = existing.created_at  # already naive UTC
+                if score_dt < act_dt:
+                    # Student submitted before the latest activation — allow retry
+                    return QuizStatusResponse(attempted=False)
+            except Exception:
+                pass
+        return QuizStatusResponse(
+            attempted=True,
+            topic=existing.topic,
+            date=existing.date,
+            score=existing.score,
+            percentage=existing.percentage
+        )
+    return QuizStatusResponse(attempted=False)
+
+
+@router.post("/api/students/mark-weak", status_code=status.HTTP_200_OK)
+def mark_student_weak(
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """Marks the authenticated student as weak by logging a 0% score for today's topic.
+    This flags them as 'weak' in the mentor's cohort dashboard."""
+    import datetime
+    today = datetime.date.today().isoformat()
+
+    # Get latest active topic from DailyTopic if available
+    from app.models import DailyTopic
+    daily = db.query(DailyTopic).filter(DailyTopic.year == current_student.year).first()
+    topic_name = daily.topic if daily else "Class Topic"
+
+    new_score = StudentScore(
+        student_id=current_student.id,
+        topic=f"{topic_name} (Not Understood)",
+        score="0/5",
+        percentage=0,
+        date=today
+    )
+    db.add(new_score)
+    db.commit()
+    return {"success": True, "message": f"Student '{current_student.username}' marked as weak for topic '{topic_name}'."}
+
+
+@router.get("/api/mentors/cohort", response_model=CohortDashboardResponse)
+def get_cohort(
+    year: str = Query("1", description="Cohort year to query ('1', '2', '3')"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Retrieves all students in a cohort with their quiz performance.
+    
+    Status logic:
+    - 'weak'   = has a score record for today's active topic AND scored < 50%
+    - 'good'   = has a score record for today's active topic AND scored >= 50%
+    - 'missed' = no score record for today's active topic at all (quiz not attempted)
+    """
+    import datetime
+    today_str = datetime.date.today().isoformat()
+
+    # Get today's active topic to determine the correct date context
+    daily = db.query(DailyTopic).filter(DailyTopic.year == year).first()
+    active_date = (daily.date if daily and daily.date else today_str)
+    active_topic = daily.topic if daily else None
+
+    students_db = db.query(Student).filter(Student.year == year).order_by(Student.username.asc()).all()
+
+    cohort_list = []
+    weak_count = 0
+    missed_count = 0
+
+    for student in students_db:
+        # Look for a score record on the active topic date (today's quiz)
+        # Only count scores submitted AFTER the current activation (updated_at) to support re-activation
+        today_score = None
+        if active_topic:
+            score_q = db.query(StudentScore)\
+                .filter(
+                    StudentScore.student_id == student.id,
+                    StudentScore.topic == active_topic,
+                    StudentScore.date == active_date
+                )
+            # If we know when the quiz was activated, only use scores from after that time
+            if daily and daily.updated_at:
+                score_q = score_q.filter(StudentScore.created_at >= daily.updated_at)
+            today_score = score_q.order_by(StudentScore.created_at.desc()).first()
+
+        # Fallback: if no active topic, use latest score overall
+        if not active_topic:
+            today_score = db.query(StudentScore)\
+                .filter(StudentScore.student_id == student.id)\
+                .order_by(StudentScore.created_at.desc())\
+                .first()
+
+        if today_score:
+            topic_text = f"{today_score.topic} (Score: {today_score.score})"
+            if today_score.not_understood:
+                st_status = "not_understood"
+                status_text = "Not Understandable"
+                weak_count += 1  # also count as weak
+            elif today_score.percentage < 50:
+                st_status = "weak"
+                status_text = "Flagged: Weak"
+                weak_count += 1
+            else:
+                st_status = "good"
+                status_text = "Completed"
+        else:
+            # Student has NOT submitted today's quiz
+            topic_text = active_topic or "-"
+            st_status = "missed"
+            status_text = "Quiz Not Attempted"
+            missed_count += 1
+
+        cohort_list.append(CohortStudent(
+            name=student.username,
+            regno=student.regno,
+            topic=topic_text,
+            status=st_status,
+            statusText=status_text
+        ))
+
+    return CohortDashboardResponse(
+        total=len(students_db),
+        weak=weak_count,
+        missed=missed_count,
+        students=cohort_list
+    )
+
+
+@router.get("/api/mentors/weak-report", response_model=WeakReportResponse)
+def get_weak_report(
+    year: str = Query("1", description="Cohort year to query ('1', '2', '3')"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Returns all weak students (percentage < 50) for a cohort year with full score detail."""
+    students = db.query(Student).filter(Student.year == year).all()
+    weak_list = []
+
+    for student in students:
+        latest_score = db.query(StudentScore)\
+            .filter(StudentScore.student_id == student.id)\
+            .order_by(StudentScore.created_at.desc())\
+            .first()
+        if latest_score and latest_score.percentage < 50:
+            weak_list.append(WeakStudentItem(
+                name=student.username,
+                regno=student.regno,
+                topic=latest_score.topic,
+                score=latest_score.score,
+                percentage=latest_score.percentage,
+                date=latest_score.date
+            ))
+
+    return WeakReportResponse(year=year, total_weak=len(weak_list), students=weak_list)
+
+
+@router.post("/api/mentors/alert-weak", response_model=MentorActionResponse)
+def alert_weak_students(
+    year: str = Query("1"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Sends a personalized alert email to every weak student (score < 50%) in the cohort."""
+    import datetime
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from app.config import settings
+
+    today_str = datetime.date.today().isoformat()
+    YEAR_FULL = {'1': '1st Year', '2': '2nd Year', '3': '3rd Year'}
+    year_label = YEAR_FULL.get(year, f'Year {year}')
+
+    # Get today's active topic for context
+    daily = db.query(DailyTopic).filter(DailyTopic.year == year).first()
+    active_topic   = daily.topic   if daily else "Recent Quiz"
+    active_subject = daily.subject if daily else ""
+
+    # Collect weak students
+    students = db.query(Student).filter(Student.year == year).all()
+    weak_students = []
+    for student in students:
+        latest_score = db.query(StudentScore)\
+            .filter(StudentScore.student_id == student.id)\
+            .order_by(StudentScore.created_at.desc())\
+            .first()
+        if latest_score and latest_score.percentage < 50:
+            weak_students.append({
+                "name":       student.username,
+                "regno":      student.regno,
+                "email":      student.email,
+                "score":      latest_score.score,
+                "percentage": latest_score.percentage,
+                "topic":      latest_score.topic or active_topic,
+            })
+
+    sent_count = 0
+    failed_emails = []
+
+    for ws in weak_students:
+        html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+  body {{ font-family: Arial, sans-serif; background: #f9fafb; color: #111; margin: 0; padding: 0; }}
+  .container {{ max-width: 600px; margin: 30px auto; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.10); }}
+  .header {{ background: linear-gradient(135deg, #7C3AED, #EC4899); color: #fff; padding: 28px 32px; }}
+  .header h1 {{ margin: 0 0 6px; font-size: 1.4rem; }}
+  .header p {{ margin: 0; opacity: 0.88; font-size: 0.88rem; }}
+  .body {{ padding: 28px 32px; }}
+  .score-box {{ background: #fff3f3; border: 1.5px solid #fca5a5; border-radius: 12px; padding: 18px 22px; margin: 18px 0; text-align: center; }}
+  .score-val {{ font-size: 2.4rem; font-weight: 900; color: #EF4444; }}
+  .score-lbl {{ font-size: 0.82rem; color: #9ca3af; margin-top: 4px; }}
+  .tips {{ background: #f5f3ff; border-radius: 12px; padding: 18px 22px; margin: 18px 0; }}
+  .tips h3 {{ margin: 0 0 10px; color: #7C3AED; font-size: 0.95rem; }}
+  .tips ul {{ margin: 0; padding-left: 18px; font-size: 0.88rem; line-height: 1.8; color: #374151; }}
+  .footer {{ padding: 18px 32px; text-align: center; font-size: 0.75rem; color: #9ca3af; border-top: 1px solid #e5e7eb; }}
+  .btn {{ display: inline-block; margin-top: 18px; padding: 12px 28px; background: linear-gradient(135deg,#7C3AED,#EC4899); color: #fff; border-radius: 8px; text-decoration: none; font-weight: 700; font-size: 0.92rem; }}
+</style></head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>⚠️ Performance Alert — Action Needed</h1>
+    <p>EduMentor AI &nbsp;|&nbsp; {year_label} &nbsp;|&nbsp; {today_str}</p>
+  </div>
+  <div class="body">
+    <p>Dear <strong>{ws['name']}</strong>,</p>
+    <p>Your mentor has reviewed your recent quiz performance and noticed that your score needs improvement. Here's a summary:</p>
+    <div class="score-box">
+      <div class="score-val">{ws['percentage']}%</div>
+      <div class="score-lbl">Score: {ws['score']} &nbsp;|&nbsp; Topic: {ws['topic']}{f' ({active_subject})' if active_subject else ''}</div>
+    </div>
+    <p>A score below 50% indicates that you may need to revisit this topic. Don't worry — with focused effort, you can improve quickly!</p>
+    <div class="tips">
+      <h3>📚 Tips to Improve</h3>
+      <ul>
+        <li>Re-read your notes and textbook on <em>{ws['topic']}</em></li>
+        <li>Attempt the quiz again after studying — practice makes perfect</li>
+        <li>Ask your mentor or classmates for help on difficult concepts</li>
+        <li>Use the EduMentor AI chat to get instant explanations</li>
+      </ul>
+    </div>
+    <p>Your mentor <strong>{current_mentor.identity}</strong> is available to help. Please reach out if you need guidance.</p>
+    <p style="margin-top: 24px; font-size: 0.85rem; color: #6b7280;">Register No: <strong>{ws['regno']}</strong></p>
+  </div>
+  <div class="footer">This alert was sent by EduMentor AI on behalf of your mentor on {today_str}.</div>
+</div>
+</body></html>"""
+
+        student_email = ws["email"]
+        subject_line  = f"[EduMentor AI] ⚠️ Performance Alert — {ws['topic']} ({ws['percentage']}%)"
+        mail_sent     = False
+
+        # Try Resend first
+        if settings.RESEND_API_KEY:
+            try:
+                import urllib.request, json as _json
+                payload = _json.dumps({
+                    "from":    settings.RESEND_FROM_EMAIL,
+                    "to":      [student_email],
+                    "subject": subject_line,
+                    "html":    html_body
+                }).encode()
+                req = urllib.request.Request(
+                    "https://api.resend.com/emails",
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status in (200, 201):
+                        mail_sent = True
+            except Exception as e:
+                logger.warning(f"Resend failed for {student_email}: {e}")
+
+        # Fallback: Gmail SMTP
+        if not mail_sent and settings.SMTP_USER and settings.SMTP_PASS:
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject_line
+                msg["From"]    = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_USER}>"
+                msg["To"]      = student_email
+                msg.attach(MIMEText(html_body, "html"))
+                with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                    server.starttls()
+                    server.login(settings.SMTP_USER, settings.SMTP_PASS)
+                    server.sendmail(settings.SMTP_USER, [student_email], msg.as_string())
+                mail_sent = True
+            except Exception as e:
+                logger.error(f"SMTP failed for {student_email}: {e}")
+
+        if mail_sent:
+            sent_count += 1
+        else:
+            failed_emails.append(student_email)
+
+    desc = f"Alert emails sent to {sent_count}/{len(weak_students)} weak student(s) in {year_label}."
+    if failed_emails:
+        desc += f" Failed: {', '.join(failed_emails)}"
+
+    action = MentorAction(
+        mentor_id=current_mentor.id,
+        year=year,
+        action_type="alert_weak",
+        description=desc,
+        student_count=sent_count
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@router.post("/api/mentors/email-inactive", response_model=MentorActionResponse)
+def email_inactive_students(
+    year: str = Query("1"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Logs that the mentor has emailed all inactive (no check-in) students."""
+    import datetime
+    today_str = datetime.date.today().isoformat()
+    daily = db.query(DailyTopic).filter(DailyTopic.year == year).first()
+    active_date = daily.date if daily and daily.date else today_str
+    active_topic = daily.topic if daily else None
+
+    students_db = db.query(Student).filter(Student.year == year).all()
+    inactive_count = 0
+    for student in students_db:
+        if active_topic:
+            score_exists = db.query(StudentScore).filter(
+                StudentScore.student_id == student.id,
+                StudentScore.topic == active_topic,
+                StudentScore.date == active_date
+            ).first()
+        else:
+            score_exists = db.query(StudentScore).filter(
+                StudentScore.student_id == student.id
+            ).first()
+        if not score_exists:
+            inactive_count += 1
+
+    action = MentorAction(
+        mentor_id=current_mentor.id,
+        year=year,
+        action_type="email_inactive",
+        description=f"Sent emails to {inactive_count} inactive student(s) in Year {year} cohort.",
+        student_count=inactive_count
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@router.get("/api/mentors/topic-performance", response_model=TopicPerformanceResponse)
+def get_topic_performance(
+    year: str = Query("1", description="Cohort year"),
+    topic: str = Query(..., description="Topic name to analyse"),
+    subject: str = Query("", description="Subject name"),
+    date: str = Query("", description="Date the topic was assigned (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Returns per-student performance breakdown for a specific topic on a specific date, including full Q&A answers."""
+    students_db = db.query(Student).filter(Student.year == year).order_by(Student.username.asc()).all()
+
+    result_students = []
+    weak_count = 0
+    attempted_count = 0
+
+    for student in students_db:
+        query = db.query(StudentScore).filter(
+            StudentScore.student_id == student.id,
+            StudentScore.topic == topic
+        )
+        if date:
+            query = query.filter(StudentScore.date == date)
+        score_rec = query.order_by(StudentScore.created_at.desc()).first()
+
+        # Look up QuizAttempt to get full Q&A records
+        att_query = db.query(QuizAttempt).filter(
+            QuizAttempt.student_id == student.id,
+            QuizAttempt.topic == topic
+        )
+        if date:
+            att_query = att_query.filter(QuizAttempt.date == date)
+        attempt_rec = att_query.order_by(QuizAttempt.created_at.desc()).first()
+        if not attempt_rec:
+            attempt_rec = db.query(QuizAttempt).filter(
+                QuizAttempt.student_id == student.id,
+                QuizAttempt.topic == topic
+            ).order_by(QuizAttempt.created_at.desc()).first()
+
+        if score_rec or attempt_rec:
+            attempted_count += 1
+            pct = score_rec.percentage if score_rec else (attempt_rec.percentage if attempt_rec else 0)
+            sc_val = score_rec.score if score_rec else (attempt_rec.score if attempt_rec else "N/A")
+            if pct < 50:
+                st_status = "weak"
+                weak_count += 1
+            else:
+                st_status = "good"
+            result_students.append(TopicPerformanceStudent(
+                name=student.username,
+                regno=student.regno,
+                status=st_status,
+                score=sc_val,
+                percentage=pct,
+                answers=attempt_rec.answers if attempt_rec else None,
+                attempted_at=attempt_rec.created_at.isoformat() if (attempt_rec and attempt_rec.created_at) else None
+            ))
+        else:
+            result_students.append(TopicPerformanceStudent(
+                name=student.username,
+                regno=student.regno,
+                status="missed",
+                score=None,
+                percentage=None,
+                answers=None,
+                attempted_at=None
+            ))
+
+    missed_count = len(students_db) - attempted_count
+
+    # Extract topic questions (mam created or AI)
+    topic_questions = None
+    gen_by = "gemini"
+    dt = db.query(DailyTopic).filter(DailyTopic.year == year, DailyTopic.topic == topic).first()
+    if dt and dt.manual_questions:
+        topic_questions = dt.manual_questions
+        gen_by = "mentor"
+    else:
+        th = db.query(TopicHistory).filter(TopicHistory.year == year, TopicHistory.topic == topic).order_by(TopicHistory.id.desc()).first()
+        if th and th.manual_questions:
+            topic_questions = th.manual_questions
+            gen_by = "mentor"
+        else:
+            any_att = db.query(QuizAttempt).filter(QuizAttempt.topic == topic).order_by(QuizAttempt.created_at.desc()).first()
+            if any_att and any_att.answers:
+                topic_questions = [
+                    {
+                        "type": a.get("type", "MCQ"),
+                        "q": a.get("q", ""),
+                        "a": a.get("correct_answer", a.get("a", "")),
+                        "options": a.get("options")
+                    }
+                    for a in any_att.answers
+                ]
+
+    return TopicPerformanceResponse(
+        year=year,
+        topic=topic,
+        subject=subject,
+        date=date if date else None,
+        total=len(students_db),
+        attempted=attempted_count,
+        weak_count=weak_count,
+        missed_count=missed_count,
+        students=result_students,
+        questions=topic_questions,
+        generated_by=gen_by
+    )
+
+
+@router.post("/api/mentors/send-report", response_model=SendReportResponse)
+def send_mentor_report(
+    year: str = Query("1", description="Cohort year"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Generates a full HTML performance report for the cohort and emails it to the mentor."""
+    import datetime
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from app.config import settings
+
+    today_str = datetime.date.today().isoformat()
+    YEAR_FULL = {'1': '1st Year', '2': '2nd Year', '3': '3rd Year'}
+    year_label = YEAR_FULL.get(year, f'Year {year}')
+
+    # Get today's active topic
+    daily = db.query(DailyTopic).filter(DailyTopic.year == year).first()
+    active_topic = daily.topic if daily else None
+    active_subject = daily.subject if daily else "N/A"
+    active_date = daily.date if daily and daily.date else today_str
+
+    students_db = db.query(Student).filter(Student.year == year).order_by(Student.username.asc()).all()
+
+    rows_html = ""
+    weak_count = 0
+    missed_count = 0
+
+    for student in students_db:
+        if active_topic:
+            score_rec = db.query(StudentScore).filter(
+                StudentScore.student_id == student.id,
+                StudentScore.topic == active_topic,
+                StudentScore.date == active_date
+            ).order_by(StudentScore.created_at.desc()).first()
+        else:
+            score_rec = db.query(StudentScore).filter(
+                StudentScore.student_id == student.id
+            ).order_by(StudentScore.created_at.desc()).first()
+
+        if score_rec:
+            pct = score_rec.percentage
+            if pct < 50:
+                status_text = "⚠️ Weak"
+                row_color = "#fff3f3"
+                weak_count += 1
+            else:
+                status_text = "✅ Good"
+                row_color = "#f3fff6"
+            score_display = score_rec.score
+        else:
+            pct = "-"
+            status_text = "🔴 Missed"
+            row_color = "#fffbf0"
+            score_display = "Not Attempted"
+            missed_count += 1
+
+        rows_html += f"""
+        <tr style="background:{row_color}">
+          <td style="padding:10px 14px;border-bottom:1px solid #e5e7eb">{student.username}</td>
+          <td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;font-family:monospace">{student.regno}</td>
+          <td style="padding:10px 14px;border-bottom:1px solid #e5e7eb">{score_display}</td>
+          <td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;text-align:center">
+            {str(pct) + '%' if str(pct).isdigit() else pct}
+          </td>
+          <td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;font-weight:700">{status_text}</td>
+        </tr>"""
+
+    html_body = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"><style>
+      body {{ font-family: Arial, sans-serif; background: #f9fafb; color: #111; margin: 0; padding: 0; }}
+      .container {{ max-width: 720px; margin: 0 auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }}
+      .header {{ background: linear-gradient(135deg, #7C3AED, #EC4899); color: #fff; padding: 28px 32px; }}
+      .header h1 {{ margin: 0 0 6px; font-size: 1.5rem; }}
+      .header p {{ margin: 0; opacity: 0.85; font-size: 0.9rem; }}
+      .stats {{ display: flex; gap: 12px; padding: 20px 32px; background: #f3f4f6; }}
+      .stat {{ background: #fff; border-radius: 10px; padding: 14px 20px; flex: 1; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
+      .stat-val {{ font-size: 1.8rem; font-weight: 900; }}
+      .stat-lbl {{ font-size: 0.75rem; color: #6b7280; margin-top: 2px; }}
+      table {{ width: 100%; border-collapse: collapse; }}
+      th {{ background: #7C3AED; color: #fff; padding: 11px 14px; text-align: left; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }}
+      .footer {{ padding: 20px 32px; text-align: center; font-size: 0.78rem; color: #9ca3af; border-top: 1px solid #e5e7eb; }}
+    </style></head>
+    <body>
+    <div class="container">
+      <div class="header">
+        <h1>📊 EduMentor AI — Student Performance Report</h1>
+        <p>{year_label} Cohort &nbsp;|&nbsp; Topic: {active_topic or 'All Topics'} ({active_subject}) &nbsp;|&nbsp; Generated: {today_str}</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="stat-val" style="color:#7C3AED">{len(students_db)}</div><div class="stat-lbl">Total Students</div></div>
+        <div class="stat"><div class="stat-val" style="color:#EF4444">{weak_count}</div><div class="stat-lbl">Weak (&lt;50%)</div></div>
+        <div class="stat"><div class="stat-val" style="color:#F59E0B">{missed_count}</div><div class="stat-lbl">Missed Quiz</div></div>
+        <div class="stat"><div class="stat-val" style="color:#10B981">{len(students_db)-weak_count-missed_count}</div><div class="stat-lbl">Performing Well</div></div>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Student Name</th><th>Register No.</th><th>Score</th><th style="text-align:center">Percentage</th><th>Status</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+      <div class="footer">This report was auto-generated by EduMentor AI on {today_str}. Sent to: {current_mentor.identity}</div>
+    </div>
+    </body></html>"""
+
+    mentor_email = current_mentor.identity  # identity is email or ID
+    sent = False
+    error_msg = ""
+
+    # Try Resend first
+    if settings.RESEND_API_KEY:
+        try:
+            import urllib.request
+            import json as _json
+            resend_payload = _json.dumps({
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [mentor_email],
+                "subject": f"[EduMentor AI] {year_label} Student Performance Report — {today_str}",
+                "html": html_body
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=resend_payload,
+                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}", "Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in (200, 201):
+                    sent = True
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"Resend failed: {e}")
+
+    # Fallback: SMTP
+    if not sent and settings.SMTP_USER and settings.SMTP_PASS:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"[EduMentor AI] {year_label} Student Performance Report — {today_str}"
+            msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_USER}>"
+            msg["To"] = mentor_email
+            msg.attach(MIMEText(html_body, "html"))
+            with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                server.starttls()
+                server.login(settings.SMTP_USER, settings.SMTP_PASS)
+                server.sendmail(settings.SMTP_USER, [mentor_email], msg.as_string())
+            sent = True
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"SMTP send failed: {e}")
+
+    # Log action regardless
+    action = MentorAction(
+        mentor_id=current_mentor.id,
+        year=year,
+        action_type="send_report",
+        description=f"Performance report {'sent' if sent else 'attempted'} to {mentor_email} for {year_label}.",
+        student_count=len(students_db)
+    )
+    db.add(action)
+    db.commit()
+
+    return SendReportResponse(
+        success=sent,
+        message=f"Report {'sent successfully' if sent else 'could not be sent: ' + error_msg} to {mentor_email}",
+        mentor_email=mentor_email,
+        year=year,
+        total_students=len(students_db),
+        weak_count=weak_count,
+        missed_count=missed_count
+    )
+
+
+@router.get("/api/mentors/student-detail", response_model=StudentDetailResponse)
+def get_student_detail(
+    regno: str = Query(..., description="Student registration number"),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """Returns full score history for a specific student (mentors only)."""
+    student = db.query(Student).filter(Student.regno == regno).first()
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student with regno '{regno}' not found.")
+
+    scores = db.query(StudentScore)\
+        .filter(StudentScore.student_id == student.id)\
+        .order_by(StudentScore.created_at.desc())\
+        .all()
+
+    # Determine latest status
+    if scores:
+        latest_status = "weak" if scores[0].percentage < 50 else "good"
+    else:
+        latest_status = "missed"
+
+    return StudentDetailResponse(
+        name=student.username,
+        regno=student.regno,
+        dept=student.dept,
+        year=student.year,
+        email=student.email,
+        scores=[
+            StudentScoreHistory(
+                topic=s.topic,
+                score=s.score,
+                percentage=s.percentage,
+                date=s.date
+            ) for s in scores
+        ],
+        latest_status=latest_status
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+#  AI-POWERED QUIZ GENERATION (Gemini)
+# ═══════════════════════════════════════════════════════════
+
+def _call_gemini(prompt: str) -> str:
+    """Call Google Gemini API using the new google.genai SDK. Raises on failure."""
+    client = google_genai.Client(api_key=settings.GEMINI_API_KEY)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
+    return response.text
+
+
+def _extract_json(text: str):
+    """Extract first JSON array or object from text (strips markdown fences)."""
+    # Remove markdown code fences if present
+    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    # Find first [ or {
+    start = min(
+        (text.find("[") if text.find("[") != -1 else len(text)),
+        (text.find("{") if text.find("{") != -1 else len(text))
+    )
+    return json.loads(text[start:])
+
+
+FALLBACK_QUESTIONS = [
+    {"type": "MCQ", "q": "What does CPU stand for?", "a": "Central Processing Unit",
+     "options": ["Central Processing Unit", "Computer Personal Unit", "Core Processing Utility", "Central Program Unit"]},
+    {"type": "MCQ", "q": "Which data structure uses LIFO order?", "a": "Stack",
+     "options": ["Queue", "Stack", "Linked List", "Tree"]},
+    {"type": "TF", "q": "A binary tree can have at most two child nodes per parent.", "a": "True",
+     "options": ["True", "False"]},
+    {"type": "TF", "q": "RAM is a type of non-volatile memory.", "a": "False",
+     "options": ["True", "False"]},
+    {"type": "Fill", "q": "The process of converting source code to machine code is called ______.", "a": "compilation"},
+    {"type": "Fill", "q": "In Python, indentation is used to define ______.", "a": "blocks"},
+]
+
+
+@router.post("/api/mentors/preview-quiz", response_model=QuizGenerateResponse)
+def mentor_preview_quiz(
+    payload: QuizGenerateRequest,
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """
+    Mentor-only endpoint: generates a preview of quiz questions for a given topic+subject.
+    Mentors can use this to see what students will be asked before activating a topic.
+    Uses the same Gemini AI logic as the student quiz generation endpoint.
+    """
+    topic = payload.topic.strip()
+    subject = payload.subject.strip()
+    mcq = max(0, min(payload.counts.mcq, 8))
+    tf  = max(0, min(payload.counts.tf,  5))
+    fill = max(0, min(payload.counts.fill, 4))
+    total = mcq + tf + fill
+
+    if settings.GEMINI_API_KEY:
+        try:
+            seed = random.randint(1000, 9999)
+            prompt = f"""You are an expert professor generating a quiz STRICTLY on the topic "{topic}" as taught in the subject "{subject}".
+Seed={seed} (vary questions each time).
+
+CRITICAL RULES:
+- ALL questions MUST be specifically about "{topic}" as it is covered in the "{subject}" subject.
+- Frame every question from the perspective of "{subject}" — use subject-specific terminology.
+- Questions must be MODERATE difficulty for undergraduate students.
+
+Generate EXACTLY: {mcq} MCQ questions, {tf} True/False questions, {fill} fill-in-the-blank questions.
+Each MCQ must have exactly 4 options array with the correct answer included.
+True/False options must always be ["True", "False"].
+Fill-in-the-blank: short single-word or phrase answer, no options field.
+Return ONLY a valid JSON array, no markdown, no explanation:
+
+[
+  {{"type": "MCQ", "q": "question text", "a": "correct answer", "options": ["opt1","opt2","opt3","opt4"]}},
+  {{"type": "TF",  "q": "statement",     "a": "True",           "options": ["True","False"]}},
+  {{"type": "Fill","q": "sentence with ______", "a": "answer"}}
+]"""
+            raw = _call_gemini(prompt)
+            data = _extract_json(raw)
+
+            questions = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                q_type = str(item.get("type", "MCQ")).upper()
+                if q_type not in ("MCQ", "TF", "FILL"):
+                    q_type = "MCQ"
+                questions.append(QuizQuestion(
+                    type=q_type,
+                    q=str(item.get("q", "")),
+                    a=str(item.get("a", "")),
+                    options=item.get("options") if q_type != "FILL" else None
+                ))
+
+            if questions:
+                return QuizGenerateResponse(topic=topic, questions=questions, generated_by="gemini")
+
+            raise ValueError("Gemini returned 0 valid questions")
+
+        except Exception as e:
+            logger.error(f"Mentor quiz preview failed for topic '{topic}': {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"AI quiz preview failed for topic '{topic}'. Check Gemini API key and retry."
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Gemini API key not configured. Cannot generate quiz preview."
+    )
+
+
+@router.get("/api/students/get-manual-questions", response_model=QuizGenerateResponse)
+def get_manual_questions(
+    topic: str = Query(..., description="Topic to get manual questions for"),
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Returns mentor-created manual questions for the current topic.
+    NO AI involved. If no manual questions exist, returns 404.
+    """
+    topic = topic.strip()
+    logger.info(f"[ManualQ] get-manual-questions called: topic='{topic}' year='{current_student.year}'")
+
+    # Check DailyTopic first
+    daily_topic = db.query(DailyTopic).filter(
+        DailyTopic.year == current_student.year
+    ).first()
+
+    manual_qs_raw = None
+    if daily_topic:
+        db_topic = (daily_topic.topic or "").strip()
+        logger.info(f"[ManualQ] DailyTopic: db_topic='{db_topic}' req_topic='{topic}' has_manual={bool(daily_topic.manual_questions)}")
+        if (daily_topic.manual_questions
+                and isinstance(daily_topic.manual_questions, list)
+                and len(daily_topic.manual_questions) > 0
+                and db_topic.lower() == topic.lower()):
+            manual_qs_raw = daily_topic.manual_questions
+            logger.info(f"[ManualQ] Found {len(manual_qs_raw)} questions in DailyTopic")
+
+    # Fallback: TopicHistory
+    if not manual_qs_raw:
+        history_rec = (
+            db.query(TopicHistory)
+            .filter(TopicHistory.year == current_student.year)
+            .order_by(TopicHistory.created_at.desc())
+            .first()
+        )
+        if (history_rec and history_rec.manual_questions
+                and isinstance(history_rec.manual_questions, list)
+                and len(history_rec.manual_questions) > 0
+                and (history_rec.topic or "").strip().lower() == topic.lower()):
+            manual_qs_raw = history_rec.manual_questions
+            logger.info(f"[ManualQ] Found {len(manual_qs_raw)} questions in TopicHistory")
+
+    if not manual_qs_raw:
+        logger.warning(f"[ManualQ] No manual questions found for topic='{topic}' year='{current_student.year}'")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No manual questions found for topic '{topic}'. Ask your mentor to create questions."
+        )
+
+    questions = []
+    for item in manual_qs_raw:
+        if not isinstance(item, dict):
+            continue
+        q_type = str(item.get("type", "MCQ")).upper()
+        if q_type not in ("MCQ", "TF", "FILL", "SHORT"):
+            q_type = "MCQ"
+        questions.append(QuizQuestion(
+            type=q_type,
+            q=str(item.get("q", "")).strip(),
+            a=str(item.get("a", "")).strip(),
+            options=item.get("options") if q_type not in ("FILL", "SHORT") else None
+        ))
+
+    # Filter out any blank questions
+    questions = [q for q in questions if q.q and q.a]
+
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual questions exist but are incomplete. Ask your mentor to fix them."
+        )
+
+    logger.info(f"[ManualQ] Returning {len(questions)} manual questions for topic='{topic}'")
+    return QuizGenerateResponse(topic=topic, questions=questions, generated_by="mentor")
+
+
+@router.post("/api/students/generate-quiz", response_model=QuizGenerateResponse)
+def generate_quiz(
+    payload: QuizGenerateRequest,
+    db: Session = Depends(get_db),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Generates a fresh set of quiz questions for the given topic using Google Gemini AI.
+    If the mentor has manually set questions for today's topic, those are returned directly.
+    Falls back to AI generation if no manual questions exist.
+    """
+    topic = payload.topic.strip()
+    subject = payload.subject.strip()
+
+    logger.info(f"[Quiz] generate-quiz called: topic='{topic}' subject='{subject}' year='{current_student.year}'")
+
+    # ── Check for mentor-authored manual questions first ──
+    # Match by both year AND topic name to avoid using stale questions from a previous session
+    daily_topic = db.query(DailyTopic).filter(
+        DailyTopic.year == current_student.year
+    ).first()
+
+    manual_qs_raw = None
+    if daily_topic:
+        dt_topic = (daily_topic.topic or "").strip().lower()
+        req_topic = topic.lower()
+        has_manual = bool(daily_topic.manual_questions and isinstance(daily_topic.manual_questions, list) and len(daily_topic.manual_questions) > 0)
+        logger.info(f"[Quiz] DailyTopic found: db_topic='{dt_topic}' req_topic='{req_topic}' has_manual={has_manual}")
+        if has_manual and dt_topic == req_topic:
+            manual_qs_raw = daily_topic.manual_questions
+            logger.info(f"[Quiz] Using {len(manual_qs_raw)} manual questions from DailyTopic")
+        elif has_manual and dt_topic != req_topic:
+            logger.warning(f"[Quiz] Topic mismatch! DailyTopic has '{dt_topic}' but student requested '{req_topic}' — skipping manual questions")
+    else:
+        logger.warning(f"[Quiz] No DailyTopic found for year={current_student.year}")
+
+    if manual_qs_raw is None:
+        # Fallback: check TopicHistory for the most recent manual questions for this topic
+        history_rec = (
+            db.query(TopicHistory)
+            .filter(
+                TopicHistory.year == current_student.year,
+                TopicHistory.topic == topic,
+            )
+            .order_by(TopicHistory.created_at.desc())
+            .first()
+        )
+        if (history_rec and history_rec.manual_questions
+                and isinstance(history_rec.manual_questions, list)
+                and len(history_rec.manual_questions) > 0):
+            manual_qs_raw = history_rec.manual_questions
+            logger.info(f"[Quiz] Using {len(manual_qs_raw)} manual questions from TopicHistory")
+
+    if manual_qs_raw:
+        questions = []
+        for item in manual_qs_raw:
+            if not isinstance(item, dict):
+                continue
+            q_type = str(item.get("type", "MCQ")).upper()
+            if q_type not in ("MCQ", "TF", "FILL", "SHORT"):
+                q_type = "MCQ"
+            questions.append(QuizQuestion(
+                type=q_type,
+                q=str(item.get("q", "")),
+                a=str(item.get("a", "")),
+                options=item.get("options") if q_type not in ("FILL", "SHORT") else None
+            ))
+        if questions:
+            logger.info(f"[Quiz] Returning {len(questions)} manual questions for topic '{topic}' (year={current_student.year})")
+            return QuizGenerateResponse(topic=topic, questions=questions, generated_by="mentor")
+
+    # ── AI generation — use robust multi-model fallback ──
+    mcq = max(1, min(payload.counts.mcq, 8))  # ensure at least 1 if all zeros
+    tf  = max(0, min(payload.counts.tf,  5))
+    fill = max(0, min(payload.counts.fill, 4))
+    # If counts are all 0, default to 3 MCQ
+    if mcq + tf + fill == 0:
+        mcq = 3
+
+    logger.info(f"[Quiz] No manual questions found for '{topic}' — falling back to AI (mcq={mcq}, tf={tf}, fill={fill})")
+
+    from app.utils.gemini_service import call_gemini_with_fallback
+
+    if settings.GEMINI_API_KEY:
+        try:
+            seed = random.randint(1000, 9999)  # force variation on each call
+            prompt = f"""You are an expert professor generating a quiz STRICTLY on the topic "{topic}" as taught in the subject "{subject}".
+Seed={seed} (vary questions each time).
+
+CRITICAL RULES:
+- ALL questions MUST be specifically about "{topic}" as it is covered in the "{subject}" subject.
+- Frame every question from the perspective of "{subject}" — use subject-specific terminology, examples, and concepts.
+  For example, if subject is "Software Engineering" and topic is "Black Box Testing",
+  questions must be about Black Box Testing as taught in Software Engineering (test cases, equivalence partitioning,
+  boundary value analysis, acceptance testing, etc.) — NOT generic programming or other CS topics.
+- Do NOT generate generic or loosely connected questions.
+- Questions must be MODERATE difficulty — not too easy, not too hard:
+  * MCQ: Clear, well-worded questions with 4 plausible options; test understanding of key concepts of "{topic}".
+  * True/False: Test important facts and common concepts about "{topic}" — avoid trick questions.
+  * Fill-in-the-blank: Test standard terminology and key definitions related to "{topic}" in "{subject}".
+- Question difficulty mix: 30% easy (recall/definition), 50% medium (application/understanding), 20% hard (analysis).
+- Questions should be suitable for undergraduate students learning "{topic}" for the first or second time.
+
+Generate EXACTLY: {mcq} MCQ questions, {tf} True/False questions, {fill} fill-in-the-blank questions.
+Each MCQ must have exactly 4 options array with the correct answer included.
+True/False options must always be ["True", "False"].
+Fill-in-the-blank: short single-word or phrase answer, no options field.
+Return ONLY a valid JSON array, no markdown, no explanation:
+
+[
+  {{"type": "MCQ", "q": "question text", "a": "correct answer", "options": ["opt1","opt2","opt3","opt4"]}},
+  {{"type": "TF",  "q": "statement",     "a": "True",           "options": ["True","False"]}},
+  {{"type": "Fill","q": "sentence with ______", "a": "answer"}}
+]"""
+            # Use the robust multi-model fallback (retries across gemini-2.0-flash, 1.5-flash, etc.)
+            raw = call_gemini_with_fallback(prompt)
+            data = _extract_json(raw)
+
+            questions = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                q_type = str(item.get("type", "MCQ")).upper()
+                if q_type not in ("MCQ", "TF", "FILL"):
+                    q_type = "MCQ"
+                questions.append(QuizQuestion(
+                    type=q_type,
+                    q=str(item.get("q", "")),
+                    a=str(item.get("a", "")),
+                    options=item.get("options") if q_type != "FILL" else None
+                ))
+
+            if questions:  # Return whatever we got
+                logger.info(f"[Quiz] AI generated {len(questions)} questions for topic '{topic}'")
+                return QuizGenerateResponse(topic=topic, questions=questions, generated_by="gemini")
+
+            # Gemini returned no parseable questions
+            raise ValueError("Gemini returned 0 valid questions for this topic")
+
+        except Exception as e:
+            logger.error(f"[Quiz] AI quiz generation failed for topic '{topic}': {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"AI quiz generation failed for topic '{topic}'. Please retry or ask mentor to create questions manually."
+            )
+
+    # ── No API key configured ──
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Gemini API key not configured. Ask your mentor to create quiz questions manually."
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+#  AI-POWERED LEARNING RESOURCES (Gemini)
+# ═══════════════════════════════════════════════════════════
+
+FALLBACK_RESOURCES = {
+    "youtube": [
+        {"title": f"Learn on YouTube", "url": "https://www.youtube.com/results?search_query=computer+science+tutorial"},
+    ],
+    "websites": [
+        {"title": "GeeksforGeeks", "url": "https://www.geeksforgeeks.org/"},
+        {"title": "W3Schools", "url": "https://www.w3schools.com/"},
+    ]
+}
+
+
+@router.get("/api/students/learning-resources", response_model=LearningResourcesResponse)
+def get_learning_resources(
+    topic: str = Query(..., description="Topic to generate resources for"),
+    subject: str = Query("", description="Subject the topic belongs to (e.g. Software Engineering)"),
+    current_student: Student = Depends(get_current_student)
+):
+    """
+    Returns topic-specific YouTube links and learning websites using Google Gemini AI.
+    Scoped to subject + topic for accurate, subject-relevant resources.
+    Falls back to generic resources if Gemini is unavailable.
+    """
+    topic = topic.strip()
+    subject = subject.strip()
+    subject_ctx = f" as taught in {subject}" if subject else ""
+    yt_query = (subject.lower().replace(" ", "+") + "+" if subject else "") + topic.lower().replace(" ", "+") + "+tutorial"
+
+    if settings.GEMINI_API_KEY:
+        try:
+            prompt = f"""You are an expert educator. Suggest learning resources for the topic "{topic}"{subject_ctx}.
+
+IMPORTANT: Resources must be specifically about "{topic}" in the context of "{subject if subject else 'Computer Science'}".
+For example, if subject is "Software Engineering" and topic is "Black Box Testing",
+suggest resources about Black Box Testing from a Software Engineering / testing perspective.
+
+Return ONLY a valid JSON object (no markdown, no extra text):
+{{
+  "youtube": [
+    {{"title": "descriptive video title", "url": "https://www.youtube.com/results?search_query=..."}},
+    {{"title": "another video", "url": "https://www.youtube.com/results?search_query=..."}},
+    {{"title": "third video", "url": "https://www.youtube.com/results?search_query=..."}}
+  ],
+  "websites": [
+    {{"title": "site name and description", "url": "https://actual-website.com/page"}},
+    {{"title": "another site", "url": "https://another-site.com"}},
+    {{"title": "third site", "url": "https://third-site.com"}}
+  ]
+}}
+
+Rules:
+- YouTube URLs must be real youtube.com/results?search_query=<encoded-search> links about "{topic}" in "{subject if subject else 'CS'}"
+- Website URLs must be real, well-known educational sites (GeeksforGeeks, W3Schools, MDN, Khan Academy, Programiz, etc.)
+- All links must be specifically relevant to "{topic}" in the "{subject if subject else 'CS'}" subject
+- Return exactly 3 youtube and 3 website items"""
+
+            raw = _call_gemini(prompt)
+            data = _extract_json(raw)
+
+            youtube = [
+                LearningResourceItem(title=r["title"], url=r["url"])
+                for r in data.get("youtube", [])[:3]
+                if r.get("title") and r.get("url")
+            ]
+            websites = [
+                LearningResourceItem(title=r["title"], url=r["url"])
+                for r in data.get("websites", [])[:3]
+                if r.get("title") and r.get("url")
+            ]
+
+            if youtube or websites:
+                return LearningResourcesResponse(
+                    topic=topic, youtube=youtube, websites=websites, generated_by="gemini"
+                )
+        except Exception:
+            pass
+
+    # ── Fallback ──
+    return LearningResourcesResponse(
+        topic=topic,
+        youtube=[LearningResourceItem(
+            title=f"{topic} Tutorial – YouTube Search",
+            url=f"https://www.youtube.com/results?search_query={yt_query}"
+        )],
+        websites=[
+            LearningResourceItem(title="GeeksforGeeks", url=f"https://www.geeksforgeeks.org/?s={topic.replace(' ', '+')}"),
+            LearningResourceItem(title="W3Schools", url="https://www.w3schools.com/"),
+        ],
+        generated_by="fallback"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUIZ ATTEMPT — save full Q&A when student finishes a quiz
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/api/students/submit-attempt", status_code=status.HTTP_201_CREATED)
+def submit_quiz_attempt(
+    payload: dict,
+    db: Session = Depends(get_db),
+    student: Student = Depends(get_current_student)
+):
+    """
+    Called by the frontend when a student finishes a quiz.
+    Saves the full Q&A: question text, student answer, correct answer, is_correct.
+
+    Expected payload:
+    {
+      "topic": "DML",
+      "subject": "Database Management Systems",
+      "date": "2026-09-29",
+      "score": "4/5",
+      "percentage": 80,
+      "answers": [
+        { "q": "...", "type": "MCQ", "student_answer": "...", "correct_answer": "...", "is_correct": true },
+        ...
+      ]
+    }
+    """
+    import datetime as _dt
+    today_str = _dt.date.today().isoformat()
+
+    topic    = payload.get("topic", "").strip()
+    subject  = payload.get("subject", "").strip()
+    date_str = payload.get("date", today_str)
+    score    = payload.get("score", "0/0")
+    pct      = int(payload.get("percentage", 0))
+    answers  = payload.get("answers", [])
+
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
+    if not isinstance(answers, list) or len(answers) == 0:
+        raise HTTPException(status_code=400, detail="answers list is required and must not be empty")
+
+    attempt = QuizAttempt(
+        student_id=student.id,
+        topic=topic,
+        subject=subject or None,
+        date=date_str,
+        score=score,
+        percentage=pct,
+        answers=answers,
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+
+    return {"success": True, "attempt_id": attempt.id}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MENTOR — view a student's quiz Q&A for a specific topic+date
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/mentors/student-attempts")
+def get_student_attempts(
+    regno: str = Query(..., description="Student register number"),
+    topic: str = Query(..., description="Topic name"),
+    date: Optional[str] = Query(None, description="Date (YYYY-MM-DD). Omit for latest attempt."),
+    db: Session = Depends(get_db),
+    current_mentor: Mentor = Depends(get_current_mentor)
+):
+    """
+    Mentor-only: returns the full quiz Q&A for a student on a given topic.
+    If date is omitted, returns the most recent attempt for that topic.
+    """
+    student = db.query(Student).filter(Student.regno == regno).first()
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student with regno '{regno}' not found")
+
+    query = db.query(QuizAttempt).filter(
+        QuizAttempt.student_id == student.id,
+        QuizAttempt.topic == topic,
+    )
+    if date:
+        query = query.filter(QuizAttempt.date == date)
+
+    attempt = query.order_by(QuizAttempt.created_at.desc()).first()
+
+    if not attempt:
+        return {
+            "found": False,
+            "regno": regno,
+            "name": student.username,
+            "topic": topic,
+            "message": "No quiz attempt found for this student on this topic."
+        }
+
+    return {
+        "found": True,
+        "regno": regno,
+        "name": student.username,
+        "topic": attempt.topic,
+        "subject": attempt.subject,
+        "date": attempt.date,
+        "score": attempt.score,
+        "percentage": attempt.percentage,
+        "answers": attempt.answers,   # list of { q, type, student_answer, correct_answer, is_correct }
+        "attempted_at": attempt.created_at.isoformat() if attempt.created_at else None,
+    }
